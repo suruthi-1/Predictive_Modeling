@@ -274,9 +274,6 @@ Data Analytics | Machine Learning | R Programming
 
 *Data Analytics Internship – Predictive Modeling Project*
 
-## 13. License
-
-No license has been selected yet. If you plan to make this repository publicly reusable, choose an appropriate open-source license and add its license file before publishing.
 
 ---
 
