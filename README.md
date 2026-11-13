@@ -64,9 +64,8 @@ The project follows an end-to-end machine learning workflow:
 ```text
 Predictive-Modeling-Framework/
 │
-├── Predictive_Modeling_Framework.docx
-├── Yield_Forecasting_Framework.Rmd
-├── Yield_Forecasting_Framework.R
+├── Predictive_Modeling.docx
+├── Predictive_modeling_framework.Rmd
 ├── README.md
 │
 └── images/
