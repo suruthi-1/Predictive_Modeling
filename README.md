@@ -23,24 +23,7 @@
 | **Development Environment** | RStudio / Posit Cloud |
 | **Project Focus** | Agricultural Yield Forecasting |
 
-## 📑 Table of Contents
 
-1. [Project Overview](#1-project-overview)
-2. [Project Objectives](#2-project-objectives)
-3. [Workflow](#3-project-workflow)
-4. [Repository Structure](#4-repository-structure)
-5. [Technical Implementation](#5-technical-implementation)
-6. [Model Performance and Results](#6-model-performance-and-results)
-7. [Visualizations](#7-visualizations)
-8. [How to Run the Project](#8-how-to-run-the-project)
-9. [Technologies and Packages](#9-technologies-and-packages)
-10. [Universal Applicability](#10-universal-applicability)
-11. [Limitations](#11-limitations)
-12. [Future Improvements](#12-future-improvements)
-13. [Author](#13-author)
-14. [License](#14-license)
-
----
 
 ## 1. Project Overview
 
