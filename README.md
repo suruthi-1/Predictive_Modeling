@@ -16,7 +16,6 @@
 
 | Detail | Description |
 |---|---|
-| **Author** | Suruthi D |
 | **Project Type** | Data Analytics Internship – Predictive Modeling Task |
 | **Domain** | Agriculture and Data Analytics |
 | **Programming Language** | R |
