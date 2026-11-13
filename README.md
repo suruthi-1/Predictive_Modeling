@@ -75,7 +75,8 @@ Predictive-Modeling-Framework/
     ├── project.jpg
     ├── workflow.png
 
-```text
+```
+
 | File | Description |
 |---|---|
 | `Predictive_Modeling_Framework.docx` | Full report: framework, features, training process, evaluation, simulation results, risks and mitigation, appendices |
