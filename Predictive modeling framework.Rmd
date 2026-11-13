@@ -1,0 +1,713 @@
+---
+title: "Predictive Modeling Framework for Agricultural Yield Forecasting: Simulation in R"
+author: "Suruthi D"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  word_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_width: 6.5
+    fig_height: 4
+    fig_caption: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 6.5, fig.height = 4, dpi = 150)
+```
+
+# Introduction and Purpose
+
+This document applies the predictive modeling framework for crop yield forecasting to a simulated agribusiness dataset, using R. Every stage of the framework is implemented as code, run and interpreted: data simulation, cleaning, exploratory analysis, feature engineering and selection, data splitting, model training and tuning, evaluation, uncertainty quantification, interpretability, scenario (what-if) analysis, a classification variant, drift monitoring, and a test of the framework on different agribusiness scenarios.
+
+The data is **synthetic** (generated with a fixed random seed), so the results show how the framework behaves and must not be read as real-world yields. The same code can be reused on real data by replacing the simulation step with a data import.
+
+**Packages used.** Install them once (this chunk is not run automatically):
+
+```{r install, eval=FALSE}
+install.packages(c("tidyverse", "glmnet", "ranger", "xgboost", "rpart", "rpart.plot", "knitr"))
+```
+
+```{r packages}
+library(tidyverse)   # dplyr, tidyr, ggplot2 ...
+library(glmnet)      # ridge / LASSO / elastic net
+library(ranger)      # fast random forest, quantile regression forest
+library(xgboost)     # gradient boosting
+library(rpart)       # decision trees
+library(rpart.plot)  # tree plots
+library(knitr)       # tables
+
+set.seed(42)
+theme_set(theme_minimal(base_size = 11))
+green <- "#1F5C3A"; orange <- "#D98324"
+```
+
+# Data Simulation
+
+## Simulator function
+
+The function below generates district-level yield data for any crop. Its inputs are crop parameters (`p`), so the same function creates different agribusiness scenarios (used later in Section 17). Yield depends on non-linear rainfall response, diminishing returns to fertilizer, heat and dry-spell stress, soil quality, vegetation index (NDVI), a technology trend, district effects and random noise.
+
+```{r simulator}
+zone_levels <- c("North", "South", "East", "West")
+
+p_maize <- list(rain_mean = 900, rain_sd = 220, rain_opt = 950, rain_width = 450,
+                tmax_mean = 33, base = 1.2, rain_w = 1.6, fert_w = 1.1, yscale = 1, scale = 1)
+
+sim_crop_data <- function(n_districts = 60, years = 2010:2023, p = p_maize, seed = 42) {
+  set.seed(seed)
+  districts <- tibble(
+    district = 1:n_districts,
+    dist_eff = rnorm(n_districts, 0, 0.25),
+    soil_om = runif(n_districts, 0.5, 3),
+    soil_ph = runif(n_districts, 5.5, 8),
+    irrigated_share = runif(n_districts, 0.1, 0.9),
+    zone = factor(sample(zone_levels, n_districts, replace = TRUE), levels = zone_levels)
+  )
+  crossing(year = years, district = 1:n_districts) %>%
+    left_join(districts, by = "district") %>%
+    mutate(
+      rainfall  = rnorm(n(), p$rain_mean, p$rain_sd),
+      tmax      = rnorm(n(), p$tmax_mean, 1.8),
+      dry_spell = pmax(0, rnorm(n(), 10, 5)),
+      heat_days = pmax(0, rnorm(n(), 6, 4) + (tmax - p$tmax_mean) * 1.5),
+      ndvi      = pmin(0.9, pmax(0.2, 0.55 + 0.00018 * (rainfall - p$rain_mean) -
+                                   0.01 * heat_days + rnorm(n(), 0, 0.05))),
+      fertilizer = runif(n(), 40, 160),
+      rain_eff  = pmax(1 - ((rainfall - p$rain_opt) / p$rain_width)^2, -0.5),
+      fert_eff  = 1 - exp(-fertilizer / 70),
+      yield_t_ha = p$yscale * (p$base + p$rain_w * rain_eff * (0.6 + 0.4 * irrigated_share) +
+                                 p$fert_w * fert_eff + 0.25 * soil_om - 0.15 * abs(soil_ph - 6.8) -
+                                 0.045 * heat_days - 0.03 * dry_spell + 1.5 * (ndvi - 0.55) +
+                                 0.03 * (year - min(years)) + dist_eff +
+                                 0.45 * rain_eff * fert_eff + rnorm(n(), 0, 0.25)),
+      yield_t_ha = pmax(yield_t_ha, 0.5 * p$yscale)
+    ) %>%
+    select(-rain_eff, -fert_eff, -dist_eff)
+}
+```
+
+## Adding real-world messiness
+
+Real datasets contain missing values, recording errors and duplicates. These are injected deliberately so that the cleaning step can be demonstrated.
+
+```{r messify}
+messify <- function(df, seed = 1) {
+  set.seed(seed)
+  n <- nrow(df)
+  df$ndvi[sample(n, round(0.06 * n))]      <- NA
+  df$soil_ph[sample(n, round(0.04 * n))]   <- NA
+  df$rainfall[sample(n, round(0.03 * n))]  <- NA
+  out <- sample(n, 8)
+  df$yield_t_ha[out] <- df$yield_t_ha[out] * 6      # impossible yield values
+  bind_rows(df, df[sample(n, 5), ])                 # 5 duplicated records
+}
+
+raw <- sim_crop_data(60, 2010:2023, p_maize, seed = 42) %>% messify(seed = 1)
+glimpse(raw)
+```
+
+# Data Cleaning and Quality Checks
+
+```{r cleaning-audit}
+audit <- tibble(
+  Check = c("Rows", "Duplicate rows", "Missing values (all columns)", "Yields above robust limit (median + 5 MAD)"),
+  Count = c(nrow(raw), sum(duplicated(raw)), sum(is.na(raw)),
+            sum(raw$yield_t_ha > median(raw$yield_t_ha) + 5 * mad(raw$yield_t_ha)))
+)
+kable(audit, caption = "Data quality audit before cleaning")
+
+missing_tbl <- tibble(Variable = names(raw), Missing = colSums(is.na(raw)),
+                      Percent = round(100 * colSums(is.na(raw)) / nrow(raw), 1)) %>% filter(Missing > 0)
+kable(missing_tbl, caption = "Missing values by variable")
+```
+
+The cleaning rules are: remove exact duplicates, and remove implausible yields using a robust limit (median + 5 median absolute deviations). Missing predictor values are **not** filled here; they are imputed later using training-set medians only, which prevents data leakage.
+
+```{r cleaning}
+clean_data <- function(df) {
+  limit <- median(df$yield_t_ha, na.rm = TRUE) + 5 * mad(df$yield_t_ha, na.rm = TRUE)
+  df %>% distinct() %>% filter(!is.na(yield_t_ha), yield_t_ha > 0, yield_t_ha <= limit)
+}
+clean <- clean_data(raw)
+cat("Rows before:", nrow(raw), " Rows after:", nrow(clean), "\n")
+```
+
+# Exploratory Data Analysis
+
+```{r eda-summary}
+num_summary <- clean %>% select(yield_t_ha, rainfall, tmax, dry_spell, heat_days, ndvi, fertilizer) %>%
+  pivot_longer(everything(), names_to = "Variable") %>% group_by(Variable) %>%
+  summarise(Mean = mean(value, na.rm = TRUE), SD = sd(value, na.rm = TRUE),
+            Min = min(value, na.rm = TRUE), Median = median(value, na.rm = TRUE), Max = max(value, na.rm = TRUE))
+kable(num_summary, digits = 2, caption = "Summary statistics of key variables")
+```
+
+```{r eda-yield-dist, fig.cap="Distribution of yield (t/ha)"}
+ggplot(clean, aes(yield_t_ha)) + geom_histogram(bins = 30, fill = green, colour = "white") +
+  labs(x = "Yield (t/ha)", y = "Count")
+```
+
+```{r eda-trend, fig.cap="Mean yield by season with one standard deviation"}
+clean %>% group_by(year) %>% summarise(m = mean(yield_t_ha), s = sd(yield_t_ha)) %>%
+  ggplot(aes(year, m)) + geom_ribbon(aes(ymin = m - s, ymax = m + s), fill = "#BFE0CC") +
+  geom_line(colour = green, linewidth = 1) + geom_point(colour = green) +
+  labs(x = "Season", y = "Yield (t/ha)")
+```
+
+```{r eda-relationships, fig.cap="Relationship of yield with rainfall and fertilizer (smoothed)"}
+clean %>% select(yield_t_ha, rainfall, fertilizer, heat_days) %>%
+  pivot_longer(-yield_t_ha, names_to = "Driver", values_to = "x") %>%
+  ggplot(aes(x, yield_t_ha)) + geom_point(alpha = .25, size = .8, colour = green) +
+  geom_smooth(method = "loess", se = FALSE, colour = orange) +
+  facet_wrap(~Driver, scales = "free_x") + labs(x = NULL, y = "Yield (t/ha)")
+```
+
+```{r eda-zone, fig.cap="Yield by agro-climatic zone"}
+ggplot(clean, aes(zone, yield_t_ha, fill = zone)) + geom_boxplot(show.legend = FALSE) +
+  scale_fill_brewer(palette = "Greens") + labs(x = "Zone", y = "Yield (t/ha)")
+```
+
+```{r eda-corr, fig.cap="Correlation matrix of numeric variables"}
+cm <- cor(clean %>% select(yield_t_ha, rainfall, tmax, dry_spell, heat_days, ndvi, fertilizer,
+                           irrigated_share, soil_om, soil_ph), use = "pairwise.complete.obs")
+as.data.frame(as.table(cm)) %>%
+  ggplot(aes(Var1, Var2, fill = Freq)) + geom_tile() +
+  geom_text(aes(label = round(Freq, 2)), size = 2.5) +
+  scale_fill_gradient2(low = "#B2182B", mid = "white", high = green, limits = c(-1, 1), name = "r") +
+  labs(x = NULL, y = NULL) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**Interpretation.** Yield rises and then falls with rainfall (a non-linear, peaked response), shows diminishing returns to fertilizer, and falls with heat-stress days. These patterns confirm that a purely linear model will be inadequate and that non-linear learners are justified.
+
+# Feature Engineering
+
+Agronomic and statistical features are created from the raw variables: previous-season yield (by district), interaction terms, a squared fertilizer term for diminishing returns, a heat-dry stress interaction and a time trend.
+
+```{r features}
+target <- "yield_t_ha"
+num_feats <- c("rainfall", "tmax", "dry_spell", "heat_days", "ndvi", "fertilizer", "irrigated_share",
+               "soil_om", "soil_ph", "lag_yield", "rain_x_irr", "fert_sq", "heat_x_dry", "trend")
+feats <- c(num_feats, "zone")
+
+recompute <- function(d) d %>% mutate(rain_x_irr = rainfall * irrigated_share,
+                                      fert_sq = fertilizer^2 / 100,
+                                      heat_x_dry = heat_days * dry_spell)
+
+engineer <- function(df) {
+  df %>% arrange(district, year) %>% group_by(district) %>%
+    mutate(lag_yield = lag(yield_t_ha)) %>% ungroup() %>%
+    recompute() %>% mutate(trend = year - 2010)
+}
+
+dat <- clean %>% engineer() %>% filter(!is.na(lag_yield))
+cat("Modeling dataset:", nrow(dat), "rows,", length(feats), "predictors\n")
+```
+
+# Data Splitting
+
+The split is **time-based**: the model learns from earlier seasons, is tuned on the next two, and is finally tested on the two most recent seasons, which stay locked until the end. Imputation values come from the training set only.
+
+```{r split}
+split_by_year <- function(d) {
+  yrs <- sort(unique(d$year)); n <- length(yrs)
+  list(train = d %>% filter(year <= yrs[n - 4]),
+       val   = d %>% filter(year %in% yrs[(n - 3):(n - 2)]),
+       test  = d %>% filter(year %in% yrs[(n - 1):n]))
+}
+get_medians <- function(d) d %>% summarise(across(all_of(num_feats), ~ median(.x, na.rm = TRUE)))
+impute <- function(d, med) { for (v in num_feats) d[[v]][is.na(d[[v]])] <- med[[v]]; d }
+
+sp <- split_by_year(dat)
+med <- get_medians(sp$train)
+sp <- lapply(sp, impute, med = med)
+dat_all <- impute(dat, med)           # imputed full data (used for spatial / rolling CV)
+
+kable(tibble(Set = c("Train", "Validation", "Test"),
+             Seasons = sapply(sp, function(d) paste(range(d$year), collapse = " - ")),
+             Rows = sapply(sp, nrow)), caption = "Time-based data split")
+```
+
+# Feature Selection
+
+## Correlation filter and multicollinearity
+
+```{r collinearity}
+cm2 <- cor(sp$train[, num_feats]); diag(cm2) <- 0
+high <- which(abs(cm2) > 0.85, arr.ind = TRUE)
+high <- high[high[, 1] < high[, 2], , drop = FALSE]
+if (nrow(high) > 0) {
+  kable(tibble(Feature_1 = rownames(cm2)[high[, 1]], Feature_2 = colnames(cm2)[high[, 2]],
+               Correlation = round(cm2[high], 2)), caption = "Feature pairs with |r| > 0.85")
+} else cat("No feature pairs with |r| > 0.85\n")
+
+vif_tbl <- tibble(Feature = num_feats, VIF = sapply(num_feats, function(v) {
+  r2 <- summary(lm(reformulate(setdiff(num_feats, v), v), data = sp$train))$r.squared
+  1 / (1 - r2) })) %>% arrange(desc(VIF))
+kable(vif_tbl, digits = 2, caption = "Variance inflation factors (values above 10 signal strong multicollinearity)")
+```
+
+## Design matrix helper
+
+```{r design-matrix}
+X <- function(d) model.matrix(~ . - 1, data = as.data.frame(d[, feats]))   # one-hot encodes zone
+season_fold <- function(d, k = 5) as.integer(factor(d$year)) %% k + 1
+```
+
+## LASSO (embedded selection)
+
+```{r lasso, fig.cap="LASSO cross-validation curve (folds grouped by season)"}
+lasso_cv <- cv.glmnet(X(sp$train), sp$train[[target]], alpha = 1, foldid = season_fold(sp$train))
+plot(lasso_cv)
+co <- coef(lasso_cv, s = "lambda.min")
+lasso_tbl <- tibble(Feature = rownames(co), Coefficient = as.numeric(co)) %>%
+  filter(Feature != "(Intercept)", Coefficient != 0) %>% arrange(desc(abs(Coefficient)))
+kable(lasso_tbl, digits = 3, caption = "Features retained by LASSO at the best lambda")
+```
+
+Random forest permutation importance and XGBoost gain (Section 13) provide further evidence for the final feature set.
+
+# Model Training Functions
+
+Every model is wrapped in a function `fp_*(train, test)` that fits on the training data and returns predictions for the test data. Using one common interface lets the same code perform cross-validation, validation, testing, spatial checks and monitoring.
+
+```{r wrappers}
+rmse <- function(o, p) sqrt(mean((o - p)^2))
+r2   <- function(o, p) 1 - sum((o - p)^2) / sum((o - mean(o))^2)
+metrics <- function(o, p) tibble(RMSE = rmse(o, p), MAE = mean(abs(o - p)),
+                                 MAPE = 100 * mean(abs((o - p) / o)), R2 = r2(o, p), Bias = mean(p - o))
+
+fp_base <- function(tr, te) te$lag_yield
+
+fp_lm <- function(tr, te) {
+  m <- lm(yield_t_ha ~ ., data = as.data.frame(tr[, c(target, feats)]))
+  as.numeric(predict(m, as.data.frame(te[, feats])))
+}
+
+fp_glmnet <- function(alpha) function(tr, te) {
+  m <- cv.glmnet(X(tr), tr[[target]], alpha = alpha, foldid = season_fold(tr))
+  as.numeric(predict(m, X(te), s = "lambda.min"))
+}
+
+fp_tree <- function(tr, te) {
+  m <- rpart(yield_t_ha ~ ., data = as.data.frame(tr[, c(target, feats)]),
+             control = rpart.control(cp = 0.001, minsplit = 15))
+  m <- prune(m, cp = m$cptable[which.min(m$cptable[, "xerror"]), "CP"])
+  as.numeric(predict(m, as.data.frame(te[, feats])))
+}
+
+fp_rf <- function(tr, te, mtry = 5, min.node.size = 5) {
+  m <- ranger(yield_t_ha ~ ., data = as.data.frame(tr[, c(target, feats)]), num.trees = 500,
+              mtry = mtry, min.node.size = min.node.size, seed = 42)
+  predict(m, as.data.frame(te[, feats]))$predictions
+}
+
+fp_xgb <- function(tr, te, params = list(), nrounds = 400) {
+  p <- modifyList(list(objective = "reg:squarederror", eta = 0.05, max_depth = 4,
+                       subsample = 0.8, colsample_bytree = 0.8, min_child_weight = 3), params)
+  set.seed(42)
+  m <- xgb.train(params = p, data = xgb.DMatrix(X(tr), label = tr[[target]]), nrounds = nrounds, verbose = 0)
+  predict(m, xgb.DMatrix(X(te)))
+}
+
+cv_rmse <- function(fp, d, k = 5) {
+  fold <- season_fold(d, k); pred <- numeric(nrow(d))
+  for (i in 1:k) { idx <- fold == i; pred[idx] <- fp(d[!idx, ], d[idx, ]) }
+  rmse(d[[target]], pred)
+}
+```
+## Workflow of the framework
+
+```{r workflow, fig.cap="End-to-end predictive modeling workflow with feedback loop", fig.height=6.5}
+steps <- c("1. Problem definition\n(target, unit, horizon, KPI)",
+           "2. Data collection and integration\n(weather, soil, NDVI, management, market)",
+           "3. Cleaning and EDA\n(missing values, outliers, correlations)",
+           "4. Feature engineering and selection\n(agronomic features, LASSO, importance)",
+           "5. Data splitting\n(time-based, spatial CV, locked test set)",
+           "6. Model training and selection\n(baseline, linear, trees, boosting, ensemble)",
+           "7. Evaluation and reliability\n(RMSE, R2, intervals, diagnostics)",
+           "8. Deployment and monitoring\n(dashboard, drift tracking, retraining)")
+wf <- tibble(id = 1:8, label = steps, y = 9 - (1:8), ends = id %in% c(1, 8))
+
+ggplot() +
+  geom_tile(data = wf, aes(x = 0, y = y, fill = ends), width = 6, height = 0.75, colour = green) +
+  geom_text(data = wf, aes(x = 0, y = y, label = label, colour = ends), size = 3.1, fontface = "bold") +
+  geom_segment(data = wf[-8, ], aes(x = 0, xend = 0, y = y - 0.42, yend = y - 0.58),
+               colour = green, arrow = arrow(length = unit(0.15, "cm"))) +
+  geom_path(data = tibble(x = c(3.05, 3.7, 3.7, 3.05), y = c(2, 2, 6, 6)), aes(x, y),
+            colour = orange, linetype = "dashed", arrow = arrow(length = unit(0.15, "cm"))) +
+  annotate("text", x = 3.85, y = 4, label = "Feedback loop", angle = 90, colour = orange, size = 3.2) +
+  scale_fill_manual(values = c("FALSE" = "#DCEFE3", "TRUE" = green), guide = "none") +
+  scale_colour_manual(values = c("FALSE" = "#12301f", "TRUE" = "white"), guide = "none") +
+  xlim(-3.2, 4.1) + theme_void()
+```
+
+The dashed orange arrow shows the feedback loop: weak validation results send the work back to cleaning, features or model choice, and drift triggers retraining.
+
+# Hyperparameter Tuning
+
+Grid search is used for the two tree-based models. Settings are compared on the validation seasons (never the test seasons).
+
+```{r tuning-rf}
+rf_grid <- expand.grid(mtry = c(3, 5, 8), min.node.size = c(3, 5, 10))
+rf_grid$Val_RMSE <- mapply(function(m, n) rmse(sp$val[[target]], fp_rf(sp$train, sp$val, m, n)),
+                           rf_grid$mtry, rf_grid$min.node.size)
+rf_best <- rf_grid[which.min(rf_grid$Val_RMSE), ]
+kable(rf_grid[order(rf_grid$Val_RMSE), ], digits = 3, row.names = FALSE, caption = "Random forest grid search")
+```
+
+```{r tuning-xgb}
+xgb_grid <- expand.grid(max_depth = c(3, 4, 6), eta = c(0.03, 0.08), nrounds = c(200, 400))
+xgb_grid$Val_RMSE <- mapply(function(d, e, n)
+  rmse(sp$val[[target]], fp_xgb(sp$train, sp$val, list(max_depth = d, eta = e), n)),
+  xgb_grid$max_depth, xgb_grid$eta, xgb_grid$nrounds)
+xgb_best <- xgb_grid[which.min(xgb_grid$Val_RMSE), ]
+kable(head(xgb_grid[order(xgb_grid$Val_RMSE), ], 6), digits = 3, row.names = FALSE,
+      caption = "XGBoost grid search (six best settings)")
+
+fp_rf_tuned  <- function(tr, te) fp_rf(tr, te, rf_best$mtry, rf_best$min.node.size)
+fp_xgb_tuned <- function(tr, te) fp_xgb(tr, te, list(max_depth = xgb_best$max_depth, eta = xgb_best$eta), xgb_best$nrounds)
+fp_ens       <- function(tr, te) rowMeans(cbind(fp_rf_tuned(tr, te), fp_xgb_tuned(tr, te), fp_glmnet(1)(tr, te)))
+```
+
+# Model Comparison
+
+Eight models are compared, from a naive baseline to an ensemble: cross-validated RMSE on the training seasons (grouped by season), RMSE on the validation seasons, and the final locked test seasons.
+
+```{r comparison}
+models <- list(
+  "Baseline (last-season yield)" = fp_base,
+  "Linear regression"            = fp_lm,
+  "Ridge"                        = fp_glmnet(0),
+  "LASSO"                        = fp_glmnet(1),
+  "Decision tree"                = fp_tree,
+  "Random forest (tuned)"        = fp_rf_tuned,
+  "XGBoost (tuned)"              = fp_xgb_tuned,
+  "Ensemble (RF + XGB + LASSO)"  = fp_ens
+)
+
+results <- bind_rows(lapply(names(models), function(nm) {
+  fp <- models[[nm]]
+  pv <- fp(sp$train, sp$val); pt <- fp(sp$train, sp$test)
+  tibble(Model = nm, CV_RMSE = cv_rmse(fp, sp$train), Val_RMSE = rmse(sp$val[[target]], pv),
+         Test_RMSE = rmse(sp$test[[target]], pt), Test_MAE = mean(abs(sp$test[[target]] - pt)),
+         Test_MAPE = 100 * mean(abs((sp$test[[target]] - pt) / sp$test[[target]])),
+         Test_R2 = r2(sp$test[[target]], pt))
+}))
+kable(results, digits = 3, caption = "Model comparison (RMSE and MAE in t/ha)")
+```
+
+```{r comparison-plot, fig.cap="Test RMSE by model (lower is better)"}
+ggplot(results, aes(reorder(Model, -Test_RMSE), Test_RMSE)) +
+  geom_col(fill = green) + geom_text(aes(label = round(Test_RMSE, 3)), hjust = -0.1, size = 3) +
+  coord_flip() + expand_limits(y = max(results$Test_RMSE) * 1.12) + labs(x = NULL, y = "Test RMSE (t/ha)")
+```
+
+```{r select-best}
+cand <- results %>% filter(!grepl("Baseline", Model))
+best_name <- cand$Model[which.min(cand$Val_RMSE)]       # chosen on validation data, not test data
+best_fp   <- models[[best_name]]
+pred_test <- best_fp(sp$train, sp$test)
+cat("Selected model (lowest validation RMSE):", best_name, "\n")
+```
+
+The best model is chosen using **validation** error, and its test performance is then reported once. Compared with the naive baseline, the improvement is shown below.
+
+```{r improvement}
+base_rmse <- results$Test_RMSE[grepl("Baseline", results$Model)]
+best_rmse <- results$Test_RMSE[results$Model == best_name]
+cat(sprintf("Baseline test RMSE: %.3f t/ha | %s test RMSE: %.3f t/ha | reduction: %.0f%%\n",
+            base_rmse, best_name, best_rmse, 100 * (1 - best_rmse / base_rmse)))
+```
+
+# Model Diagnostics and Reliability
+
+## Predicted versus observed and residuals
+
+```{r diagnostics}
+diag_df <- tibble(obs = sp$test[[target]], pred = pred_test, resid = obs - pred,
+                  year = sp$test$year, district = sp$test$district)
+kable(metrics(diag_df$obs, diag_df$pred), digits = 3, caption = paste("Final test-set metrics:", best_name))
+```
+
+```{r diag-plot1, fig.cap="Predicted versus observed yield on the test seasons"}
+ggplot(diag_df, aes(obs, pred)) + geom_point(alpha = .5, colour = green) +
+  geom_abline(slope = 1, intercept = 0, colour = orange, linetype = "dashed") +
+  labs(x = "Observed yield (t/ha)", y = "Predicted yield (t/ha)")
+```
+
+```{r diag-plot2, fig.cap="Residuals versus predicted values (should show no pattern)"}
+ggplot(diag_df, aes(pred, resid)) + geom_point(alpha = .5, colour = green) +
+  geom_hline(yintercept = 0, colour = orange, linetype = "dashed") + geom_smooth(se = FALSE, colour = "grey40") +
+  labs(x = "Predicted yield (t/ha)", y = "Residual (t/ha)")
+```
+
+```{r diag-plot3, fig.cap="Normal Q-Q plot of residuals"}
+ggplot(diag_df, aes(sample = resid)) + stat_qq(colour = green) + stat_qq_line(colour = orange) +
+  labs(x = "Theoretical quantiles", y = "Residual quantiles")
+```
+
+```{r diag-tests}
+sw <- shapiro.test(diag_df$resid)
+ct <- cor.test(abs(diag_df$resid), diag_df$pred)
+kable(tibble(Test = c("Shapiro-Wilk (residual normality)", "Correlation of |residual| with prediction (heteroscedasticity)"),
+             Statistic = c(unname(sw$statistic), unname(ct$estimate)), P_value = c(sw$p.value, ct$p.value)),
+      digits = 3, caption = "Residual diagnostic tests (p > 0.05 suggests no violation)")
+```
+
+## Uncertainty of the performance estimate (bootstrap) and comparison with baseline
+
+```{r bootstrap}
+set.seed(42)
+boot <- replicate(1000, { i <- sample(nrow(diag_df), replace = TRUE); rmse(diag_df$obs[i], diag_df$pred[i]) })
+cat(sprintf("Test RMSE = %.3f t/ha, 95%% bootstrap interval: %.3f to %.3f\n",
+            rmse(diag_df$obs, diag_df$pred), quantile(boot, .025), quantile(boot, .975)))
+
+wt <- wilcox.test(abs(sp$test[[target]] - sp$test$lag_yield), abs(diag_df$resid), paired = TRUE, alternative = "greater")
+cat(sprintf("Paired Wilcoxon test (baseline errors larger than model errors): p = %.4g\n", wt$p.value))
+```
+
+## Stability across seasons, regions and rolling origins
+
+```{r stability}
+by_year <- diag_df %>% group_by(year) %>% summarise(RMSE = rmse(obs, pred), Rows = n())
+kable(by_year, digits = 3, caption = "Test error by season")
+
+by_zone <- sp$test %>% mutate(pred = pred_test) %>% group_by(zone) %>%
+  summarise(RMSE = rmse(yield_t_ha, pred), Rows = n())
+kable(by_zone, digits = 3, caption = "Test error by zone (checks for regional bias)")
+```
+
+```{r spatial-cv}
+fold_d <- as.integer(factor(dat_all$district)) %% 5 + 1
+sp_pred <- numeric(nrow(dat_all))
+for (i in 1:5) { idx <- fold_d == i; sp_pred[idx] <- best_fp(dat_all[!idx, ], dat_all[idx, ]) }
+kable(metrics(dat_all[[target]], sp_pred), digits = 3,
+      caption = "Spatial cross-validation: whole districts held out (generalization to new locations)")
+```
+
+```{r rolling}
+yrs <- sort(unique(dat_all$year)); origins <- tail(yrs, 6)
+roll <- bind_rows(lapply(origins, function(y) {
+  tr <- dat_all %>% filter(year < y); te <- dat_all %>% filter(year == y)
+  tibble(Forecast_season = y, RMSE = rmse(te[[target]], best_fp(tr, te)), Training_rows = nrow(tr))
+}))
+kable(roll, digits = 3, caption = "Rolling-origin evaluation: train on all earlier seasons, forecast the next")
+```
+
+```{r rolling-plot, fig.cap="Rolling-origin forecast error by season"}
+ggplot(roll, aes(Forecast_season, RMSE)) + geom_line(colour = green, linewidth = 1) + geom_point(colour = green, size = 2) +
+  labs(x = "Forecast season", y = "RMSE (t/ha)")
+```
+
+# Uncertainty Quantification
+
+Two approaches to 90% prediction intervals are compared: a quantile regression forest and split conformal prediction (calibrated on the validation seasons).
+
+```{r intervals}
+qrf <- ranger(yield_t_ha ~ ., data = as.data.frame(sp$train[, c(target, feats)]), num.trees = 500, quantreg = TRUE,
+              mtry = rf_best$mtry, min.node.size = rf_best$min.node.size, seed = 42)
+q <- predict(qrf, as.data.frame(sp$test[, feats]), type = "quantiles", quantiles = c(0.05, 0.5, 0.95))$predictions
+cover_qrf <- mean(sp$test[[target]] >= q[, 1] & sp$test[[target]] <= q[, 3])
+
+res_val <- abs(sp$val[[target]] - best_fp(sp$train, sp$val))
+n_val <- length(res_val)
+qhat <- quantile(res_val, min(1, ceiling((n_val + 1) * 0.90) / n_val))
+cover_conf <- mean(abs(sp$test[[target]] - pred_test) <= qhat)
+
+kable(tibble(Method = c("Quantile regression forest", "Split conformal prediction"),
+             Nominal = 0.90, Empirical_coverage = c(cover_qrf, cover_conf),
+             Mean_interval_width = c(mean(q[, 3] - q[, 1]), 2 * qhat)),
+      digits = 3, caption = "Coverage of 90% prediction intervals on the test seasons")
+```
+
+```{r interval-plot, fig.cap="Conformal 90% prediction intervals on test samples (sorted by prediction)"}
+ord <- order(pred_test)
+tibble(i = seq_along(ord), pred = pred_test[ord], obs = sp$test[[target]][ord]) %>%
+  ggplot(aes(i)) + geom_ribbon(aes(ymin = pred - qhat, ymax = pred + qhat), fill = "#BFE0CC") +
+  geom_line(aes(y = pred), colour = green) + geom_point(aes(y = obs), colour = orange, size = 1) +
+  labs(x = "Test samples (sorted by prediction)", y = "Yield (t/ha)")
+```
+
+Coverage close to 90% means the intervals can be trusted for planning; coverage well below 90% means they are too narrow and must be recalibrated before use in decisions.
+
+# Interpretability and Feature Importance
+
+```{r rf-final}
+rf_final <- ranger(yield_t_ha ~ ., data = as.data.frame(sp$train[, c(target, feats)]), num.trees = 500,
+                   mtry = rf_best$mtry, min.node.size = rf_best$min.node.size, importance = "permutation", seed = 42)
+imp_rf <- tibble(Feature = names(rf_final$variable.importance), Importance = rf_final$variable.importance)
+```
+
+```{r imp-rf-plot, fig.cap="Random forest permutation importance"}
+ggplot(imp_rf, aes(reorder(Feature, Importance), Importance)) + geom_col(fill = green) + coord_flip() +
+  labs(x = NULL, y = "Permutation importance (increase in error when shuffled)")
+```
+
+```{r xgb-imp, fig.cap="XGBoost feature importance (gain)"}
+xgb_final <- xgb.train(params = list(objective = "reg:squarederror", eta = xgb_best$eta, max_depth = xgb_best$max_depth,
+                                     subsample = 0.8, colsample_bytree = 0.8, min_child_weight = 3),
+                       data = xgb.DMatrix(X(sp$train), label = sp$train[[target]]), nrounds = xgb_best$nrounds, verbose = 0)
+imp_xgb <- as.data.frame(xgb.importance(model = xgb_final))
+ggplot(head(imp_xgb, 12), aes(reorder(Feature, Gain), Gain)) + geom_col(fill = orange) + coord_flip() +
+  labs(x = NULL, y = "Gain")
+```
+
+```{r tree-plot, fig.cap="Pruned decision tree (an interpretable view of yield rules)", fig.height=5}
+tree_fit <- rpart(yield_t_ha ~ ., data = as.data.frame(sp$train[, c(target, feats)]),
+                  control = rpart.control(cp = 0.01, maxdepth = 4))
+rpart.plot(tree_fit, type = 2, extra = 101, under = FALSE, cex = 0.7, box.palette = "Greens")
+```
+
+## Partial dependence
+
+Partial dependence shows the average effect of one feature on predicted yield while the others are left as observed.
+
+```{r pdp, fig.cap="Partial dependence of predicted yield on rainfall and fertilizer (random forest)"}
+pred_rf <- function(d) predict(rf_final, as.data.frame(d[, feats]))$predictions
+pdp <- function(var, grid) tibble(Variable = var, x = grid, y = sapply(grid, function(v) {
+  d <- sp$test; d[[var]] <- v; mean(pred_rf(recompute(d))) }))
+bind_rows(pdp("rainfall", seq(450, 1400, length.out = 25)),
+          pdp("fertilizer", seq(40, 160, length.out = 25)),
+          pdp("heat_days", seq(0, 20, length.out = 25))) %>%
+  ggplot(aes(x, y)) + geom_line(colour = green, linewidth = 1) + facet_wrap(~Variable, scales = "free_x") +
+  labs(x = NULL, y = "Average predicted yield (t/ha)")
+```
+
+# Scenario (What-if) Analysis for Resource Optimization
+
+The fitted model is used to simulate decisions: yield response to fertilizer under drought, normal and excess rainfall for a typical district.
+
+```{r whatif, fig.cap="Predicted yield versus fertilizer under rainfall scenarios"}
+base_row <- sp$test %>% summarise(across(all_of(num_feats), median)) %>% mutate(zone = factor("North", levels = zone_levels))
+scen <- expand.grid(fertilizer = seq(40, 160, by = 10), rainfall = c(600, 900, 1250))
+newd <- base_row[rep(1, nrow(scen)), ]
+newd$fertilizer <- scen$fertilizer; newd$rainfall <- scen$rainfall
+newd <- recompute(newd)
+scen$pred <- pred_rf(newd)
+scen$Scenario <- factor(scen$rainfall, levels = c(600, 900, 1250),
+                        labels = c("Drought (600 mm)", "Normal (900 mm)", "Excess rain (1250 mm)"))
+ggplot(scen, aes(fertilizer, pred, colour = Scenario)) + geom_line(linewidth = 1) +
+  scale_colour_manual(values = c(orange, green, "#4C78A8")) +
+  labs(x = "Fertilizer (kg/ha)", y = "Predicted yield (t/ha)")
+```
+
+```{r whatif-table}
+wt_tbl <- scen %>% filter(fertilizer %in% c(40, 100, 160)) %>%
+  select(Scenario, fertilizer, pred) %>% pivot_wider(names_from = fertilizer, values_from = pred, names_prefix = "Fert_")
+kable(wt_tbl, digits = 2, caption = "Predicted yield (t/ha) by scenario and fertilizer dose")
+```
+
+**Use for decisions.** The gap between scenarios shows how much of the yield is controlled by water. If a drought lowers yield by more than extra fertilizer can add, resources should go to irrigation or drought-tolerant varieties, not to higher fertilizer doses.
+
+# Classification Variant: Low, Medium and High Yield Alert
+
+Some decisions need a category (for example an early-warning alert) rather than a number. The same features are used to predict yield class, defined by tertiles of the training yield.
+
+```{r classification}
+cuts <- quantile(sp$train[[target]], c(1/3, 2/3))
+to_class <- function(y) cut(y, breaks = c(-Inf, cuts, Inf), labels = c("Low", "Medium", "High"))
+tr_c <- as.data.frame(sp$train[, feats]); tr_c$yield_class <- to_class(sp$train[[target]])
+te_c <- as.data.frame(sp$test[, feats]);  obs_c <- to_class(sp$test[[target]])
+
+clf <- ranger(yield_class ~ ., data = tr_c, num.trees = 500, seed = 42)
+pred_c <- predict(clf, te_c)$predictions
+cm_tab <- table(Observed = obs_c, Predicted = pred_c)
+kable(cm_tab, caption = "Confusion matrix on the test seasons")
+
+recall <- diag(cm_tab) / rowSums(cm_tab); precision <- diag(cm_tab) / colSums(cm_tab)
+f1 <- 2 * precision * recall / (precision + recall)
+kable(tibble(Class = levels(obs_c), Precision = precision, Recall = recall, F1 = f1),
+      digits = 3, caption = sprintf("Class metrics (overall accuracy = %.3f)", sum(diag(cm_tab)) / sum(cm_tab)))
+```
+
+# Drift Monitoring and Retraining Trigger
+
+After deployment, the model must be watched. Here, future seasons (2024 and 2025) are simulated with a warmer, drier climate to represent drift. Two monitors are applied: distribution shift in the inputs (Kolmogorov-Smirnov test and Population Stability Index) and a rule on forecast error.
+
+```{r drift-data}
+p_future <- p_maize; p_future$tmax_mean <- p_maize$tmax_mean + 2; p_future$rain_mean <- p_maize$rain_mean - 120
+future <- sim_crop_data(60, 2023:2025, p_future, seed = 42) %>% engineer() %>% filter(year >= 2024)
+
+psi <- function(expected, actual, bins = 10) {
+  br <- unique(quantile(expected, probs = seq(0, 1, length.out = bins + 1), na.rm = TRUE))
+  br[1] <- -Inf; br[length(br)] <- Inf
+  e <- pmax(as.numeric(table(cut(expected, br))) / length(expected), 1e-4)
+  a <- pmax(as.numeric(table(cut(actual, br))) / length(actual), 1e-4)
+  sum((a - e) * log(a / e))
+}
+drift_vars <- c("rainfall", "tmax", "heat_days", "dry_spell", "ndvi")
+drift_tbl <- tibble(Variable = drift_vars,
+  KS_p_value = sapply(drift_vars, function(v) ks.test(sp$train[[v]], future[[v]])$p.value),
+  PSI = sapply(drift_vars, function(v) psi(sp$train[[v]], future[[v]]))) %>%
+  mutate(Drift_flag = ifelse(PSI > 0.25, "Major shift", ifelse(PSI > 0.10, "Moderate shift", "Stable")))
+kable(drift_tbl, digits = 4, caption = "Input drift between training seasons and future seasons (PSI > 0.25 = major shift)")
+```
+
+```{r drift-error}
+thr <- 1.25 * results$Val_RMSE[results$Model == best_name]
+fut_pred <- best_fp(sp$train, future)
+mon <- future %>% mutate(pred = fut_pred) %>% group_by(year) %>%
+  summarise(RMSE = rmse(yield_t_ha, pred), Bias = mean(pred - yield_t_ha)) %>%
+  mutate(Alert_threshold = thr, Retrain = RMSE > Alert_threshold)
+kable(mon, digits = 3, caption = "Forecast error monitoring (alert if RMSE exceeds 125% of validation RMSE)")
+```
+
+If an alert is raised, the model is retrained on all available seasons, including the newest, then re-validated before replacing the current model.
+
+# Universal Applicability: The Same Pipeline on Different Scenarios
+
+To show that the framework is not tied to one crop or farm type, the complete pipeline (cleaning, feature engineering, time-based split, training and testing) is wrapped in one function and run on three different agribusiness scenarios by changing only the data-generating parameters.
+
+```{r universal}
+run_pipeline <- function(raw, label) {
+  d <- raw %>% clean_data() %>% engineer() %>% filter(!is.na(lag_yield))
+  s <- split_by_year(d); m <- get_medians(s$train); s <- lapply(s, impute, med = m)
+  mods <- list(Baseline = fp_base, LASSO = fp_glmnet(1),
+               "Random forest" = function(tr, te) fp_rf(tr, te, 5, 5), XGBoost = function(tr, te) fp_xgb(tr, te))
+  bind_rows(lapply(names(mods), function(nm) {
+    p <- mods[[nm]](s$train, s$test); o <- s$test[[target]]
+    tibble(Scenario = label, Model = nm, Train_rows = nrow(s$train), Test_RMSE = rmse(o, p),
+           Relative_error_pct = 100 * rmse(o, p) / mean(o), Test_R2 = r2(o, p))
+  }))
+}
+
+p_sugar <- list(rain_mean = 1200, rain_sd = 250, rain_opt = 1300, rain_width = 600, tmax_mean = 34,
+                base = 1.0, rain_w = 1.8, fert_w = 1.3, yscale = 15, scale = 1)
+p_small <- list(rain_mean = 750, rain_sd = 260, rain_opt = 850, rain_width = 400, tmax_mean = 32,
+                base = 1.0, rain_w = 1.7, fert_w = 0.8, yscale = 1, scale = 1)
+
+scenarios <- bind_rows(
+  run_pipeline(sim_crop_data(60, 2010:2023, p_maize, 42)  %>% messify(1), "Cereal (maize), 60 districts"),
+  run_pipeline(sim_crop_data(60, 2010:2023, p_sugar, 7)   %>% messify(2), "Plantation (sugarcane), 60 districts"),
+  run_pipeline(sim_crop_data(20, 2014:2023, p_small, 11)  %>% messify(3), "Smallholder, limited data (20 districts)")
+)
+kable(scenarios, digits = 3, caption = "The same pipeline applied to three scenarios (Relative error = RMSE as % of mean yield)")
+```
+
+```{r universal-plot, fig.cap="Relative test error by scenario and model"}
+ggplot(scenarios, aes(Model, Relative_error_pct, fill = Model)) + geom_col(show.legend = FALSE) +
+  facet_wrap(~Scenario) + scale_fill_manual(values = c("grey60", "#7FB894", green, orange)) +
+  labs(x = NULL, y = "Test RMSE as % of mean yield") + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+Relative error allows comparison between crops with different yield scales (maize in t/ha versus sugarcane). The same code runs unchanged for all three scenarios, including a small smallholder dataset, which supports the claim that the framework is universal: only the data and the feature library change, while the process stays the same.
+
+# Risks and Limitations Revealed by the Simulation
+
+* **Data quality:** injected missing values, duplicates and outliers had to be handled before any model could be trusted (Section 3).
+* **Leakage and honest testing:** the time-based split, training-only imputation and a locked test set prevent over-optimistic results (Section 6).
+* **Overfitting and model choice:** the gap between cross-validation, validation and test error, and the tuning on validation data only, control this risk (Sections 9 and 10).
+* **Uncertainty:** prediction-interval coverage must be checked; conformal calibration can repair under-coverage (Section 12).
+* **Drift:** input and error monitors detect when the climate or practices change and trigger retraining (Section 16).
+* **Synthetic data:** real farm data is noisier and less complete; performance on real data must be re-validated using the same pipeline.
+
+# Conclusion
+
+The R simulation shows the framework working end to end. `r best_name` was selected on validation data and, on the locked test seasons, reduced error by about `r round(100 * (1 - best_rmse / base_rmse))`% compared with repeating last season's yield (test RMSE `r round(best_rmse, 3)` t/ha, R-squared `r round(results$Test_R2[results$Model == best_name], 2)`). Diagnostics, spatial cross-validation and rolling-origin tests assessed reliability; uncertainty intervals, importance analysis and partial dependence made the model interpretable; the what-if analysis turned predictions into resource decisions; the classification variant showed an early-warning use; drift monitoring defined when to retrain; and the same pipeline worked across three different agribusiness scenarios.
+
+# Session Information
+
+```{r session}
+sessionInfo()
+```
