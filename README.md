@@ -58,7 +58,6 @@ The project follows an end-to-end machine learning workflow:
 7. Model Evaluation and Reliability Analysis
 8. Deployment and Monitoring
 
-![Workflow Diagram](workflow-diagram.png)
 
 ## 4. Repository Structure
 
@@ -270,6 +269,9 @@ Data Analytics | Machine Learning | R Programming
 
 *Data Analytics Internship – Predictive Modeling Project*
 
+## 12.WORKFLOW FOR RSTUDIO 
+
+![Workflow Diagram](workflow-diagram.png)
 
 ---
 
