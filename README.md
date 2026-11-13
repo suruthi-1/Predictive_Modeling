@@ -266,9 +266,6 @@ Potential future enhancements include:
 - Deployment of the predictive model as a web application.
 - Continuous model performance monitoring.
 
-## 12. Author
-
-**Suruthi D**
 
 Data Analytics | Machine Learning | R Programming
 
