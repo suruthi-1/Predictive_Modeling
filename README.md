@@ -8,7 +8,7 @@
   <em>Developed using R | RStudio | Posit Cloud</em>
 </p>
 
-![Project Banner](images/project-banner.png)
+![Project Banner](images/project.png)
 
 ---
 
