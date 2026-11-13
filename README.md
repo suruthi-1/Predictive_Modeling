@@ -271,7 +271,7 @@ Data Analytics | Machine Learning | R Programming
 
 ## 12.WORKFLOW FOR RSTUDIO 
 
-![Workflow Diagram](diagram.png)
+![Workflow Diagram](workflow-diagram.png)
 _Fig:Workflow for rstudio with data viewer, environment, console & project files,_
 
 ---
